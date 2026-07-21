@@ -17,12 +17,21 @@ const server = new SorobanRpc.Server(config.sorobanRpcUrl, {
 
 export { server };
 
+/**
+ * Returns the Stellar network passphrase based on the configured network.
+ * @returns The network passphrase for the current network configuration ('PUBLIC' for mainnet, 'TESTNET' for testnet).
+ */
 export function networkPassphrase(): string {
   return config.network === 'mainnet'
     ? Networks.PUBLIC
     : Networks.TESTNET;
 }
 
+/**
+ * Fetches the latest ledger sequence number from the Soroban RPC server.
+ * @returns The sequence number of the latest ledger.
+ * @throws {Error} If the RPC call fails or the server is unreachable.
+ */
 export async function getLatestLedger(): Promise<number> {
   const ledger = await server.getLatestLedger();
   return ledger.sequence;
@@ -47,6 +56,7 @@ export class PaymentError extends Error {
 
 /**
  * Ping the Soroban RPC to verify network reachability.
+ * @returns true if the Soroban RPC server is reachable and responds successfully, false otherwise.
  */
 export async function stellarHealth(): Promise<boolean> {
   try {
@@ -64,6 +74,11 @@ export async function stellarHealth(): Promise<boolean> {
  * The contract function returns a plain bool; the expiry ledger is not
  * exposed via this entry point, so expiresAt is '' for active and null
  * for inactive/absent subscriptions.
+ * @param scoutWallet - The Stellar wallet address of the scout to check.
+ * @returns An object containing the active status (true if subscribed) and expiresAt (empty string if active, null if inactive).
+ * @throws {PaymentError} If scoutWallet is missing (code: 'INVALID_ACCOUNT').
+ * @throws {PaymentError} If the contract simulation fails (code: 'NETWORK_ERROR').
+ * @throws {PaymentError} If the RPC call fails (code: 'NETWORK_ERROR').
  */
 export async function isSubscribed(
   scoutWallet: string,
@@ -118,6 +133,10 @@ export async function isSubscribed(
 /**
  * Stub: submit a pay-to-contact micro-fee on Stellar.
  * Replace with real Soroban invocation when ready.
+ * @param scoutWallet - The Stellar wallet address of the scout initiating the payment.
+ * @param playerId - The player identifier to associate with the payment.
+ * @returns A ContactPaymentResult containing the transaction ID and payment status.
+ * @throws {PaymentError} If scoutWallet or playerId is missing (code: 'INVALID_ACCOUNT').
  */
 export async function submitContactPayment(
   scoutWallet: string,
@@ -146,6 +165,11 @@ export interface TrialOfferResult {
  * Stub: invoke the contract's `log_trial_offer(scout, player_id, details_uri)` method.
  * Creates an immutable on-chain record of the offer and promotes the player to
  * Elite Tier (Level 3). Replace with a real Soroban invocation when ready.
+ * @param scoutWallet - The Stellar wallet address of the scout making the offer.
+ * @param playerId - The player identifier receiving the trial offer.
+ * @param detailsUri - A URI pointing to the offer details (e.g., IPFS CID or HTTP URL).
+ * @returns A TrialOfferResult containing the transaction ID, player ID, details URI, and the player's new tier (3).
+ * @throws {PaymentError} If scoutWallet, playerId, or detailsUri is missing (code: 'INVALID_ACCOUNT').
  */
 export async function logTrialOffer(
   scoutWallet: string,
@@ -214,6 +238,10 @@ export class FeeWithdrawalError extends Error {
  * Stub: invoke the contract's `withdraw_fees(recipient: Address) -> u128` method.
  * Returns the withdrawn amount and transaction metadata.
  * Throws FeeWithdrawalError with code 'NO_FEES' when balance is zero.
+ * @param recipient - The Stellar address to receive the withdrawn fees.
+ * @returns A FeeWithdrawalResult containing the transaction ID, recipient address, withdrawn amount (as string), and token type.
+ * @throws {FeeWithdrawalError} If recipient is missing (code: 'INVALID_RECIPIENT').
+ * @throws {FeeWithdrawalError} If no fees are available to withdraw (code: 'NO_FEES').
  */
 export async function withdrawFees(recipient: string): Promise<FeeWithdrawalResult> {
   if (!recipient) {
@@ -241,6 +269,12 @@ export interface SubscriptionResult {
 /**
  * Stub: invoke subscribe(scout, tier, duration) on the Soroban contract.
  * Throws PaymentError with code 'INSUFFICIENT_FUNDS' for error code 7 (InsufficientFee).
+ * @param scoutWallet - The Stellar wallet address purchasing the subscription.
+ * @param tier - The subscription tier to purchase ('basic' or 'premium').
+ * @param duration - The subscription duration in days.
+ * @returns A SubscriptionResult containing the transaction ID, tier, expiry timestamp (Unix), and status.
+ * @throws {PaymentError} If scoutWallet is missing (code: 'INVALID_ACCOUNT').
+ * @throws {PaymentError} If the account has insufficient funds (code: 'INSUFFICIENT_FUNDS').
  */
 export async function purchaseSubscription(
   scoutWallet: string,
@@ -263,6 +297,12 @@ export async function purchaseSubscription(
 /**
  * Stub: invoke renew_subscription(scout, tier, duration) on the Soroban contract.
  * Extends the existing expiry by `duration` days.
+ * @param scoutWallet - The Stellar wallet address renewing the subscription.
+ * @param tier - The subscription tier to renew ('basic' or 'premium').
+ * @param duration - The additional duration in days to extend the subscription.
+ * @param currentExpiresAt - The current expiry timestamp (Unix) of the subscription.
+ * @returns A SubscriptionResult containing the transaction ID, tier, new expiry timestamp (Unix), and status.
+ * @throws {PaymentError} If scoutWallet is missing (code: 'INVALID_ACCOUNT').
  */
 export async function renewSubscription(
   scoutWallet: string,
@@ -286,9 +326,42 @@ export async function renewSubscription(
   };
 }
 
+export type SubscriptionErrorCode =
+  | 'NOT_SUBSCRIBED'
+  | 'ALREADY_CANCELLED'
+  | 'UNAUTHORIZED'
+  | 'NETWORK_ERROR';
+
 /**
- * Stub: invoke cancel_subscription(scout) on the Soroban contract.
- * Records the cancellation intent on-chain.
+ * Thrown when a cancel_subscription contract call cannot proceed due to a
+ * known on-chain state — e.g. the scout was never subscribed or the
+ * subscription was already cancelled.  These map to 4xx HTTP responses, not
+ * 5xx, so we keep them separate from PaymentError.
+ */
+export class SubscriptionError extends Error {
+  constructor(
+    message: string,
+    public readonly code: SubscriptionErrorCode,
+  ) {
+    super(message);
+    this.name = 'SubscriptionError';
+  }
+}
+
+/**
+ * Invoke `cancel_subscription(scout)` on the Soroban contract.
+ *
+ * Flow mirrors unpauseContractOnChain():
+ *   getAccount → build tx → simulateTransaction → assembleTransaction
+ *   → sign → sendTransaction → poll getTransaction until final status.
+ *
+ * On success returns the confirmed transaction hash.
+ * Maps Soroban contract error codes to SubscriptionError:
+ *   #8 NotSubscribed  → code: 'NOT_SUBSCRIBED'
+ *   #9 Unauthorized   → code: 'UNAUTHORIZED'
+ * @param scoutWallet - The Stellar wallet address canceling the subscription.
+ * @returns An object containing the transaction ID of the cancellation transaction.
+ * @throws {PaymentError} If scoutWallet is missing (code: 'INVALID_ACCOUNT').
  */
 export async function cancelSubscriptionOnChain(
   scoutWallet: string,
@@ -296,8 +369,69 @@ export async function cancelSubscriptionOnChain(
   if (!scoutWallet) {
     throw new PaymentError('Missing scoutWallet', 'INVALID_ACCOUNT');
   }
-  // TODO: build and submit cancel_subscription Soroban transaction
-  return { transactionId: `stub-cancel-txid-${Date.now()}` };
+
+  const { getPlatformKeypair } = await import('../utils/signer');
+  const keypair = getPlatformKeypair();
+
+  const account = await server.getAccount(keypair.publicKey());
+  const contract = new Contract(config.contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: networkPassphrase(),
+  })
+    .addOperation(
+      contract.call('cancel_subscription', Address.fromString(scoutWallet).toScVal()),
+    )
+    .setTimeout(30)
+    .build();
+
+  const simResult = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simResult)) {
+    const errMsg = simResult.error ?? '';
+    // Contract error #8 = NotSubscribed
+    if (errMsg.includes('#8') || /not.?subscribed/i.test(errMsg)) {
+      throw new SubscriptionError('Scout has no active on-chain subscription', 'NOT_SUBSCRIBED');
+    }
+    // Contract error #9 = Unauthorized
+    if (errMsg.includes('#9') || /unauthorized/i.test(errMsg)) {
+      throw new SubscriptionError('Unauthorized: wallet is not allowed to cancel this subscription', 'UNAUTHORIZED');
+    }
+    throw new PaymentError(`Simulation failed: ${errMsg}`, 'NETWORK_ERROR');
+  }
+
+  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+  preparedTx.sign(keypair);
+
+  const sendResult = await server.sendTransaction(preparedTx);
+  if (sendResult.status === 'ERROR') {
+    throw new PaymentError(`Submit failed: ${sendResult.errorResult}`, 'NETWORK_ERROR');
+  }
+
+  const hash = sendResult.hash;
+
+  let getResult = await server.getTransaction(hash);
+  while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+    await new Promise((r) => setTimeout(r, 1000));
+    getResult = await server.getTransaction(hash);
+  }
+
+  if (getResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+    // Inspect the result XDR for contract-level error codes.
+    // Cast through unknown because GetFailedTransactionResponse and
+    // GetSuccessfulTransactionResponse share no overlapping status type.
+    const resultMeta = ((getResult as unknown) as { resultMetaXdr?: string }).resultMetaXdr ?? '';
+    if (resultMeta.includes('#8') || /not.?subscribed/i.test(resultMeta)) {
+      throw new SubscriptionError('Scout has no active on-chain subscription', 'NOT_SUBSCRIBED');
+    }
+    if (resultMeta.includes('#9') || /unauthorized/i.test(resultMeta)) {
+      throw new SubscriptionError('Unauthorized: wallet is not allowed to cancel this subscription', 'UNAUTHORIZED');
+    }
+    throw new PaymentError('cancel_subscription transaction failed on-chain', 'NETWORK_ERROR');
+  }
+
+  return { transactionId: hash };
 }
 
 export interface ContractActionResult {
@@ -319,6 +453,11 @@ export class ContractActionError extends Error {
  * Returns the transaction hash on success.
  * Throws ContractActionError with code 'CONTRACT_NOT_PAUSED' if the simulation
  * indicates the contract is not currently paused (Soroban error code 10).
+ * @returns A ContractActionResult containing the transaction ID of the unpause transaction.
+ * @throws {ContractActionError} If the contract is not currently paused (code: 'CONTRACT_NOT_PAUSED').
+ * @throws {ContractActionError} If the simulation fails (code: 'NETWORK_ERROR').
+ * @throws {ContractActionError} If transaction submission fails (code: 'NETWORK_ERROR').
+ * @throws {ContractActionError} If the transaction fails on-chain (code: 'NETWORK_ERROR').
  */
 export async function unpauseContractOnChain(): Promise<ContractActionResult> {
   const { getPlatformKeypair } = await import('../utils/signer');
@@ -375,6 +514,10 @@ export interface UpdateProfileResult {
 /**
  * Stub: invoke the contract's `update_profile(player_id, metadata_uri)` method.
  * Replace with a real Soroban invocation via invokeContract() when the RPC integration is ready.
+ * @param playerId - The player identifier whose profile is being updated.
+ * @param metadataUri - A URI pointing to the updated profile metadata (e.g., IPFS CID or HTTP URL).
+ * @returns An UpdateProfileResult containing the transaction ID and the metadata URI.
+ * @throws {Error} If playerId or metadataUri is missing.
  */
 export async function updateProfile(
   playerId: string,
